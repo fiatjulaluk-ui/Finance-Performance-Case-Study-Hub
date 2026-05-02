@@ -1,7 +1,9 @@
+
 from __future__ import annotations
 
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -15,9 +17,10 @@ MUTED_GREY = "#6B7A8D"
 
 
 st.set_page_config(
-    page_title="Etex Australia Finance Showcase",
+    page_title="Etex Australia Finance Performance Case Study Hub",
     page_icon=":bar_chart:",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
@@ -123,8 +126,8 @@ def parse_metric(text: str) -> str:
 
 sheets = load_workbook(WORKBOOK_PATH)
 
-st.sidebar.title("Finance Showcase")
-st.sidebar.caption("Interactive app built from the Excel model.")
+st.sidebar.title("Case Study Hub")
+st.sidebar.caption("Finance performance app built from the Excel model.")
 view = st.sidebar.radio(
     "Navigate",
     [
@@ -139,7 +142,7 @@ view = st.sidebar.radio(
     ],
 )
 
-st.title("Etex Australia Management Accounting Showcase")
+st.title("Etex Australia Finance Performance Case Study Hub")
 st.caption(
     "April 2025 | AUD $000s unless stated | Built from the Excel workbook tabs, formulas, and source trail."
 )
@@ -343,10 +346,40 @@ elif view == "BGC Synergies":
     c2.metric("FY26 full-run target", money(pd.to_numeric(synergies["FY26 Full-Run AUD $000s"], errors="coerce").sum()))
     c3.metric("On-track categories", f"{on_track} of {len(synergies)}")
 
-    chart = synergies.set_index("Synergy Category")[
-        ["FY25 Target AUD $000s", "FY25 Actual AUD $000s", "FY26 Full-Run AUD $000s"]
-    ].apply(pd.to_numeric, errors="coerce")
-    st.bar_chart(chart, height=360)
+    chart = synergies[
+        [
+            "Synergy Category",
+            "FY25 Target AUD $000s",
+            "FY25 Actual AUD $000s",
+            "FY26 Full-Run AUD $000s",
+        ]
+    ].copy()
+    chart = chart[~chart["Synergy Category"].astype(str).str.contains("TOTAL", na=False)]
+    chart = chart.rename(
+        columns={
+            "FY25 Target AUD $000s": "FY25 Target",
+            "FY25 Actual AUD $000s": "FY25 Actual",
+            "FY26 Full-Run AUD $000s": "FY26 Full-Run",
+        }
+    )
+    chart_long = chart.melt("Synergy Category", var_name="Measure", value_name="AUD $000s")
+    chart_long["AUD $000s"] = pd.to_numeric(chart_long["AUD $000s"], errors="coerce")
+    synergy_chart = (
+        alt.Chart(chart_long)
+        .mark_bar()
+        .encode(
+            y=alt.Y("Synergy Category:N", sort="-x", title=None),
+            x=alt.X("AUD $000s:Q", title="AUD $000s"),
+            color=alt.Color(
+                "Measure:N",
+                scale=alt.Scale(range=[BRAND_ORANGE, "#1F77B4", "#9E9E9E"]),
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=["Synergy Category", "Measure", alt.Tooltip("AUD $000s:Q", format=",.0f")],
+        )
+        .properties(height=340)
+    )
+    st.altair_chart(synergy_chart, width="stretch")
     st.dataframe(synergies, width="stretch", hide_index=True)
 
 elif view == "Risk & ESG":
