@@ -12,6 +12,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 WORKBOOK_PATH = APP_DIR / "data" / "Etex_Australia_MA_Showcase_v5_bc.xlsx"
+PRIVATE_SHEETS = {"Etex Brand Identity"}
 
 BRAND_ORANGE = "#E8500A"
 BRAND_CHARCOAL = "#1A1A1A"
@@ -66,7 +67,7 @@ st.markdown(
 
 
 @st.cache_data(show_spinner=False)
-def load_workbook(path: Path) -> dict[str, pd.DataFrame]:
+def load_workbook(path: Path, modified_time: float) -> dict[str, pd.DataFrame]:
     if not path.exists():
         st.error(f"Workbook not found: {path}")
         st.stop()
@@ -90,6 +91,10 @@ def load_workbook(path: Path) -> dict[str, pd.DataFrame]:
         sheet: pd.read_excel(read_path, sheet_name=sheet, header=None, engine="openpyxl")
         for sheet in xls.sheet_names
     }
+
+
+def workbook_modified_time(path: Path) -> float:
+    return path.stat().st_mtime if path.exists() else 0
 
 
 def clean_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -146,8 +151,15 @@ def format_group_performance_table(group: pd.DataFrame) -> pd.DataFrame:
 
     year_cols = ["2021", "2022", "2023", "2024", "2025"]
 
+    def margin_value(value) -> float:
+        if isinstance(value, str) and value.strip().endswith("%"):
+            return as_number(value.strip().replace("%", "")) / 100
+        return as_number(value)
+
     def whole_number(value) -> str:
-        return f"{as_number(value):,.0f}"
+        number = as_number(value)
+        formatted = f"{abs(number):,.0f}"
+        return f"({formatted})" if number < 0 else formatted
 
     for idx, row in display.iterrows():
         metric = str(row["Metric"])
@@ -159,24 +171,42 @@ def format_group_performance_table(group: pd.DataFrame) -> pd.DataFrame:
                 else:
                     numeric = as_number(value)
                     display.at[idx, col] = f"{numeric:.1%}" if numeric < 1 else f"{numeric:.1f}%"
-            display.at[idx, "Variance '24-'25"] = "+20 bps"
+
+            bps_change = (margin_value(row["2025"]) - margin_value(row["2024"])) * 10_000
+            formatted_bps = f"{abs(bps_change):,.0f} bps"
+            display.at[idx, "Variance '24-'25"] = f"({formatted_bps})" if bps_change < 0 else f"+{formatted_bps}"
         elif metric in {"Revenue (EUR M)", "REBITDA (EUR M)", "Net Recurring Profit", "CapEx (EUR M)", "Net Debt (EUR M)", "Employees (FTE)"}:
             for col in year_cols:
                 display.at[idx, col] = whole_number(row[col])
 
             variance = as_number(row["2025"]) - as_number(row["2024"])
-            display.at[idx, "Variance '24-'25"] = f"{variance:+,.0f}"
+            formatted = f"{abs(variance):,.0f}"
+            display.at[idx, "Variance '24-'25"] = f"({formatted})" if variance < 0 else f"+{formatted}"
 
     return display
 
 
 def format_display_table(df: pd.DataFrame) -> pd.DataFrame:
     display = df.copy()
-    percent_terms = ("%", "margin", "rate", "delivery", "progress", "achievement", "variance %")
+    percent_terms = (
+        "%",
+        "margin",
+        "delivery",
+        "progress",
+        "achievement",
+        "variance %",
+        "yoy change",
+        "yoy chg",
+    )
+
+    def accounting_number(number: float, decimals: int = 0) -> str:
+        formatted = f"{abs(number):,.{decimals}f}"
+        return f"({formatted})" if number < 0 else formatted
 
     for col in display.columns:
         col_label = str(col).lower()
-        is_percent_col = any(term in col_label for term in percent_terms)
+        is_bps_col = "bps" in col_label or "basis point" in col_label
+        is_percent_col = not is_bps_col and any(term in col_label for term in percent_terms)
 
         def format_value(value):
             if pd.isna(value):
@@ -188,14 +218,17 @@ def format_display_table(df: pd.DataFrame) -> pd.DataFrame:
                 return value
             if isinstance(value, (int, float)):
                 number = float(value)
+                if is_bps_col:
+                    return accounting_number(number)
                 if is_percent_col:
                     pct_value = number if abs(number) > 2 else number * 100
-                    return f"{pct_value:,.1f}%"
-                if abs(number) < 1 and number != 0:
-                    return f"{number:,.1%}"
+                    return f"({abs(pct_value):,.1f}%)" if pct_value < 0 else f"{pct_value:,.1f}%"
                 if number.is_integer():
-                    return f"{number:,.0f}"
-                return f"{number:,.1f}"
+                    return accounting_number(number)
+                if abs(number) < 10:
+                    formatted = f"{abs(number):,.4f}".rstrip("0").rstrip(".")
+                    return f"({formatted})" if number < 0 else formatted
+                return accounting_number(number, 1)
             return value
 
         display[col] = display[col].map(format_value)
@@ -203,7 +236,10 @@ def format_display_table(df: pd.DataFrame) -> pd.DataFrame:
     return display
 
 
-sheets = load_workbook(WORKBOOK_PATH)
+if "refresh_workbook" not in st.session_state:
+    st.session_state.refresh_workbook = 0
+
+sheets = load_workbook(WORKBOOK_PATH, workbook_modified_time(WORKBOOK_PATH) + st.session_state.refresh_workbook)
 
 st.sidebar.title("Case Study Hub")
 st.sidebar.caption("Finance performance app built from the Excel model.")
@@ -499,9 +535,29 @@ elif view == "Controls & Audit Trail":
 
 else:
     st.markdown('<div class="section-label">Workbook content</div>', unsafe_allow_html=True)
-    sheet_name = st.selectbox("Sheet", list(sheets.keys()))
-    preview = clean_table(sheets[sheet_name].head(80))
-    st.dataframe(format_display_table(preview), width="stretch")
+    workbook_time = pd.Timestamp.fromtimestamp(workbook_modified_time(WORKBOOK_PATH)).strftime("%d %b %Y, %I:%M %p")
+    top = st.columns([2, 1, 1])
+    top[0].caption(f"Loaded directly from Excel: {WORKBOOK_PATH.name}")
+    visible_sheets = [sheet for sheet in sheets.keys() if sheet not in PRIVATE_SHEETS]
+    hidden_count = len(sheets) - len(visible_sheets)
+    hidden_note = f" ({hidden_count} private hidden)" if hidden_count else ""
+
+    top[1].caption(f"{len(visible_sheets)} sheets shown{hidden_note}")
+    top[2].caption(f"Modified: {workbook_time}")
+
+    if st.button("Refresh workbook data"):
+        st.cache_data.clear()
+        st.session_state.refresh_workbook += 1
+        st.rerun()
+
+    sheet_name = st.selectbox("Sheet", visible_sheets)
+    selected_sheet = sheets[sheet_name].dropna(how="all").dropna(axis=1, how="all")
+    preview = clean_table(selected_sheet.head(80))
+    st.caption(
+        "This preview is generated from the selected workbook sheet at runtime. "
+        "It is not a separate hardcoded table in the app."
+    )
+    st.dataframe(format_display_table(preview), width="stretch", hide_index=True)
     st.download_button(
         "Download source workbook",
         WORKBOOK_PATH.read_bytes(),
