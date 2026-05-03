@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 import altair as alt
@@ -69,9 +71,23 @@ def load_workbook(path: Path) -> dict[str, pd.DataFrame]:
         st.error(f"Workbook not found: {path}")
         st.stop()
 
-    xls = pd.ExcelFile(path)
+    read_path = path
+    temp_dir = None
+    try:
+        # Reading a temp copy avoids intermittent Windows/OneDrive/Excel file locks.
+        temp_dir = Path(tempfile.mkdtemp(prefix="etex_finance_app_"))
+        read_path = temp_dir / path.name
+        shutil.copy2(path, read_path)
+    except PermissionError:
+        st.error(
+            "The Excel workbook is locked by Windows or Excel. Close the workbook in Excel, "
+            "wait for OneDrive to finish syncing, then refresh the app."
+        )
+        st.stop()
+
+    xls = pd.ExcelFile(read_path)
     return {
-        sheet: pd.read_excel(path, sheet_name=sheet, header=None, engine="openpyxl")
+        sheet: pd.read_excel(read_path, sheet_name=sheet, header=None, engine="openpyxl")
         for sheet in xls.sheet_names
     }
 
@@ -122,6 +138,69 @@ def pct(value: float) -> str:
 
 def parse_metric(text: str) -> str:
     return str(text).split(":", 1)[-1].strip() if ":" in str(text) else str(text)
+
+
+def format_group_performance_table(group: pd.DataFrame) -> pd.DataFrame:
+    display = group.copy()
+    display = display.rename(columns={"YoY Chg": "Variance '24-'25"})
+
+    year_cols = ["2021", "2022", "2023", "2024", "2025"]
+
+    def whole_number(value) -> str:
+        return f"{as_number(value):,.0f}"
+
+    for idx, row in display.iterrows():
+        metric = str(row["Metric"])
+        if metric == "REBITDA Margin %":
+            for col in year_cols:
+                value = row[col]
+                if isinstance(value, str) and value.endswith("%"):
+                    display.at[idx, col] = value
+                else:
+                    numeric = as_number(value)
+                    display.at[idx, col] = f"{numeric:.1%}" if numeric < 1 else f"{numeric:.1f}%"
+            display.at[idx, "Variance '24-'25"] = "+20 bps"
+        elif metric in {"Revenue (EUR M)", "REBITDA (EUR M)", "Net Recurring Profit", "CapEx (EUR M)", "Net Debt (EUR M)", "Employees (FTE)"}:
+            for col in year_cols:
+                display.at[idx, col] = whole_number(row[col])
+
+            variance = as_number(row["2025"]) - as_number(row["2024"])
+            display.at[idx, "Variance '24-'25"] = f"{variance:+,.0f}"
+
+    return display
+
+
+def format_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    display = df.copy()
+    percent_terms = ("%", "margin", "rate", "delivery", "progress", "achievement", "variance %")
+
+    for col in display.columns:
+        col_label = str(col).lower()
+        is_percent_col = any(term in col_label for term in percent_terms)
+
+        def format_value(value):
+            if pd.isna(value):
+                return ""
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped in {"", "-", "n/a", "None"}:
+                    return "" if stripped in {"", "None"} else stripped
+                return value
+            if isinstance(value, (int, float)):
+                number = float(value)
+                if is_percent_col:
+                    pct_value = number if abs(number) > 2 else number * 100
+                    return f"{pct_value:,.1f}%"
+                if abs(number) < 1 and number != 0:
+                    return f"{number:,.1%}"
+                if number.is_integer():
+                    return f"{number:,.0f}"
+                return f"{number:,.1f}"
+            return value
+
+        display[col] = display[col].map(format_value)
+
+    return display
 
 
 sheets = load_workbook(WORKBOOK_PATH)
@@ -243,13 +322,13 @@ elif view == "Executive Dashboard":
         numeric_years = ["2021", "2022", "2023", "2024", "2025"]
         chart = group[["Metric", *numeric_years]].set_index("Metric").T
         st.line_chart(chart, height=320)
-        st.dataframe(group, width="stretch", hide_index=True)
+        st.dataframe(format_group_performance_table(group), width="stretch", hide_index=True)
 
     with right:
         st.subheader("Australia Strategic Context")
         context = dashboard.iloc[10:19, [9, 11]].dropna(how="all")
         context.columns = ["Topic", "Management message"]
-        st.dataframe(clean_table(context), width="stretch", hide_index=True)
+        st.dataframe(format_display_table(clean_table(context)), width="stretch", hide_index=True)
         st.info(
             "The strongest job-application story is not just reporting: it shows variance analysis, BGC integration, driver-based forecasting, controls, and source discipline."
         )
@@ -316,7 +395,7 @@ elif view == "Forecast Simulator":
     for col in ["Revenue", "Budget Revenue", "Gross Profit", "EBITDA", "CapEx"]:
         display[col] = display[col].map(lambda x: round(x, 1))
     display["EBITDA Margin"] = display["EBITDA Margin"].map(lambda x: f"{x:.1%}")
-    st.dataframe(display, width="stretch")
+    st.dataframe(format_display_table(display), width="stretch")
 
 elif view == "Variance Bridge":
     st.markdown('<div class="section-label">Management explanation</div>', unsafe_allow_html=True)
@@ -324,13 +403,13 @@ elif view == "Variance Bridge":
     bridge = slice_table(sheets, "Variance Bridge", 17, 23, 1, 8)
 
     st.subheader("April Actual vs Budget")
-    st.dataframe(summary, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(summary), width="stretch", hide_index=True)
 
     st.subheader("EBITDA Waterfall Drivers")
     bridge_chart = bridge[["Bridge Step", "Impact $000s"]].copy()
     bridge_chart["Impact $000s"] = pd.to_numeric(bridge_chart["Impact $000s"], errors="coerce").fillna(0)
     st.bar_chart(bridge_chart.set_index("Bridge Step"), height=320)
-    st.dataframe(bridge, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(bridge), width="stretch", hide_index=True)
 
 elif view == "BGC Synergies":
     st.markdown('<div class="section-label">Acquisition integration</div>', unsafe_allow_html=True)
@@ -380,7 +459,7 @@ elif view == "BGC Synergies":
         .properties(height=340)
     )
     st.altair_chart(synergy_chart, width="stretch")
-    st.dataframe(synergies, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(synergies), width="stretch", hide_index=True)
 
 elif view == "Risk & ESG":
     st.markdown('<div class="section-label">Risk, sustainability, financial linkage</div>', unsafe_allow_html=True)
@@ -389,7 +468,7 @@ elif view == "Risk & ESG":
     with risk_tab:
         risk = slice_table(sheets, "Risk & Sensitivity", 5, 11, 1, 10)
         st.subheader("Currency Sensitivity")
-        st.dataframe(risk, width="stretch", hide_index=True)
+        st.dataframe(format_display_table(risk), width="stretch", hide_index=True)
         aud_row = risk[risk["Currency"].astype(str).str.contains("Australian", na=False)]
         if not aud_row.empty:
             st.info(str(aud_row.iloc[0]["Significance to Altona"]))
@@ -397,7 +476,7 @@ elif view == "Risk & ESG":
     with esg_tab:
         esg = slice_table(sheets, "ESG-Financial Bridge", 5, 13, 1, 10)
         st.subheader("Sustainability KPI to P&L Linkage")
-        st.dataframe(esg, width="stretch", hide_index=True)
+        st.dataframe(format_display_table(esg), width="stretch", hide_index=True)
         progress = esg["Progress to Target"].value_counts()
         st.bar_chart(progress, height=260)
 
@@ -410,19 +489,19 @@ elif view == "Controls & Audit Trail":
     st.subheader("Model QA Controls")
     pass_count = int((qa["Result"] == "PASS").sum()) if "Result" in qa else 0
     st.metric("QA checks passed", f"{pass_count} of {len(qa)}")
-    st.dataframe(qa, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(qa), width="stretch", hide_index=True)
 
     st.subheader("Source Trail")
-    st.dataframe(sources, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(sources), width="stretch", hide_index=True)
 
     st.subheader("Balance Sheet Reconciliation Snapshot")
-    st.dataframe(bs_recs, width="stretch", hide_index=True)
+    st.dataframe(format_display_table(bs_recs), width="stretch", hide_index=True)
 
 else:
     st.markdown('<div class="section-label">Workbook content</div>', unsafe_allow_html=True)
     sheet_name = st.selectbox("Sheet", list(sheets.keys()))
     preview = clean_table(sheets[sheet_name].head(80))
-    st.dataframe(preview, width="stretch")
+    st.dataframe(format_display_table(preview), width="stretch")
     st.download_button(
         "Download source workbook",
         WORKBOOK_PATH.read_bytes(),
